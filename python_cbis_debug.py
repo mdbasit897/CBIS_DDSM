@@ -1,141 +1,211 @@
+import os
+import shutil
 import pandas as pd
 from pathlib import Path
 import glob
 
 
-def debug_csv_structure(base_path):
-    """Debug the CSV structure to understand the mapping"""
-    base_path = Path(base_path)
-    csv_path = base_path / "csv"
+class CBISDDSMFinalOrganizer:
+    def __init__(self, base_path):
+        self.base_path = Path(base_path)
+        self.jpeg_path = self.base_path / "jpeg"
+        self.csv_path = self.base_path / "csv"
 
-    print("=== CSV File Analysis ===")
+        # Create output directories
+        self.calc_dir = self.base_path / "organized" / "calcifications"
+        self.mass_dir = self.base_path / "organized" / "masses"
+        self.unknown_dir = self.base_path / "organized" / "unknown"
 
-    # Load and examine each CSV file
-    csv_files = {
-        'calc_train': 'calc_case_description_train_set.csv',
-        'calc_test': 'calc_case_description_test_set.csv',
-        'mass_train': 'mass_case_description_train_set.csv',
-        'mass_test': 'mass_case_description_test_set.csv',
-        'meta': 'meta.csv',
-        'dicom_info': 'dicom_info.csv'
-    }
+        # Create directories if they don't exist
+        self.calc_dir.mkdir(parents=True, exist_ok=True)
+        self.mass_dir.mkdir(parents=True, exist_ok=True)
+        self.unknown_dir.mkdir(parents=True, exist_ok=True)
 
-    for key, filename in csv_files.items():
-        file_path = csv_path / filename
-        if file_path.exists():
-            print(f"\n--- {filename} ---")
-            df = pd.read_csv(file_path)
-            print(f"Shape: {df.shape}")
-            print(f"Columns: {df.columns.tolist()}")
+        print(f"Created directories:")
+        print(f"  - Calcifications: {self.calc_dir}")
+        print(f"  - Masses: {self.mass_dir}")
+        print(f"  - Unknown: {self.unknown_dir}")
 
-            # Show first few rows
-            print("\nFirst 3 rows:")
-            print(df.head(3))
+    def load_dicom_info(self):
+        """Load dicom_info.csv which contains the direct mapping"""
+        dicom_info_path = self.csv_path / "dicom_info.csv"
 
-            # Look for image-related columns
-            img_cols = [col for col in df.columns if
-                        any(word in col.lower() for word in ['image', 'file', 'path', 'series', 'study'])]
-            if img_cols:
-                print(f"\nImage-related columns: {img_cols}")
-                for col in img_cols:
-                    print(f"Sample {col} values:")
-                    print(df[col].head(3).tolist())
+        if not dicom_info_path.exists():
+            raise FileNotFoundError(f"dicom_info.csv not found at {dicom_info_path}")
 
-    print("\n=== Image File Analysis ===")
+        print(f"Loading {dicom_info_path}")
+        df = pd.read_csv(dicom_info_path)
+        print(f"Loaded {len(df)} rows from dicom_info.csv")
 
-    # Find all JPEG files
-    jpeg_path = base_path / "jpeg"
-    jpeg_files = []
-    for ext in ['*.jpg', '*.jpeg', '*.JPG', '*.JPEG']:
-        jpeg_files.extend(glob.glob(str(jpeg_path / "**" / ext), recursive=True))
+        return df
 
-    print(f"Found {len(jpeg_files)} JPEG files")
-    print("Sample JPEG file paths:")
-    for i, file_path in enumerate(jpeg_files[:10]):
-        print(f"  {Path(file_path).name} -> {file_path}")
+    def create_image_mapping(self, dicom_df):
+        """Create mapping from JPEG filename to category (calc/mass)"""
+        image_mapping = {}
 
-    # Analyze directory structure
-    print("\n=== Directory Structure Analysis ===")
-    for jpeg_file in jpeg_files[:20]:
-        path = Path(jpeg_file)
-        print(f"File: {path.name}")
-        print(f"  Full path: {path}")
-        print(f"  Parent dirs: {path.parent.parts}")
-        print(f"  Relative to jpeg: {path.relative_to(jpeg_path)}")
-        print()
+        for _, row in dicom_df.iterrows():
+            # Get the image path and patient name
+            image_path = row['image_path']
+            patient_name = row['PatientName']
+
+            # Skip if either is missing
+            if pd.isna(image_path) or pd.isna(patient_name):
+                continue
+
+            # Extract filename from image path
+            # image_path format: 'CBIS-DDSM/jpeg/SeriesInstanceUID/filename.jpg'
+            filename = Path(image_path).name
+
+            # Determine category from PatientName
+            patient_name_lower = str(patient_name).lower()
+
+            if 'calc' in patient_name_lower:
+                category = 'calc'
+            elif 'mass' in patient_name_lower:
+                category = 'mass'
+            else:
+                category = 'unknown'
+
+            image_mapping[filename] = {
+                'category': category,
+                'patient_name': patient_name,
+                'image_path': image_path
+            }
+
+        return image_mapping
+
+    def organize_images(self):
+        """Organize images using the direct mapping from dicom_info.csv"""
+        print("\n=== Starting Image Organization ===")
+
+        # Load dicom info
+        dicom_df = self.load_dicom_info()
+
+        # Create image mapping
+        print("Creating image mapping...")
+        image_mapping = self.create_image_mapping(dicom_df)
+        print(f"Created mapping for {len(image_mapping)} images")
+
+        # Count categories
+        calc_count = sum(1 for info in image_mapping.values() if info['category'] == 'calc')
+        mass_count = sum(1 for info in image_mapping.values() if info['category'] == 'mass')
+        unknown_count = sum(1 for info in image_mapping.values() if info['category'] == 'unknown')
+
+        print(f"Mapping breakdown:")
+        print(f"  - Calc: {calc_count}")
+        print(f"  - Mass: {mass_count}")
+        print(f"  - Unknown: {unknown_count}")
+
+        # Find all JPEG files
+        print("\nFinding JPEG files...")
+        all_images = []
+        for ext in ['*.jpg', '*.jpeg', '*.JPG', '*.JPEG']:
+            all_images.extend(glob.glob(str(self.jpeg_path / "**" / ext), recursive=True))
+
+        print(f"Found {len(all_images)} JPEG files")
+
+        # Organize images
+        calc_moved = 0
+        mass_moved = 0
+        unknown_moved = 0
+        not_found = 0
+
+        for img_path in all_images:
+            img_path = Path(img_path)
+            filename = img_path.name
+
+            if filename in image_mapping:
+                info = image_mapping[filename]
+                category = info['category']
+
+                if category == 'calc':
+                    destination = self.calc_dir / filename
+                    shutil.copy2(img_path, destination)
+                    calc_moved += 1
+                    if calc_moved <= 10:  # Show first 10 for verification
+                        print(f"Calc: {filename} -> {info['patient_name']}")
+                elif category == 'mass':
+                    destination = self.mass_dir / filename
+                    shutil.copy2(img_path, destination)
+                    mass_moved += 1
+                    if mass_moved <= 10:  # Show first 10 for verification
+                        print(f"Mass: {filename} -> {info['patient_name']}")
+                else:
+                    destination = self.unknown_dir / filename
+                    shutil.copy2(img_path, destination)
+                    unknown_moved += 1
+                    if unknown_moved <= 10:  # Show first 10 for verification
+                        print(f"Unknown: {filename} -> {info['patient_name']}")
+            else:
+                # Image not found in mapping - this shouldn't happen
+                destination = self.unknown_dir / filename
+                shutil.copy2(img_path, destination)
+                not_found += 1
+                if not_found <= 10:  # Show first 10 for debugging
+                    print(f"Not in mapping: {filename}")
+
+        print(f"\n=== ORGANIZATION COMPLETE ===")
+        print(f"Calcifications: {calc_moved}")
+        print(f"Masses: {mass_moved}")
+        print(f"Unknown/Other: {unknown_moved}")
+        print(f"Not found in mapping: {not_found}")
+        print(f"Total processed: {calc_moved + mass_moved + unknown_moved + not_found}")
+
+        return {
+            'calc_moved': calc_moved,
+            'mass_moved': mass_moved,
+            'unknown_moved': unknown_moved,
+            'not_found': not_found
+        }
+
+    def verify_organization(self):
+        """Verify the organization results"""
+        print(f"\n=== VERIFICATION ===")
+
+        calc_files = list(self.calc_dir.glob("*.jpg"))
+        mass_files = list(self.mass_dir.glob("*.jpg"))
+        unknown_files = list(self.unknown_dir.glob("*.jpg"))
+
+        print(f"Files in calcifications folder: {len(calc_files)}")
+        print(f"Files in masses folder: {len(mass_files)}")
+        print(f"Files in unknown folder: {len(unknown_files)}")
+
+        # Show sample files
+        print(f"\nSample calcification files:")
+        for f in calc_files[:5]:
+            print(f"  {f.name}")
+
+        print(f"\nSample mass files:")
+        for f in mass_files[:5]:
+            print(f"  {f.name}")
+
+        if unknown_files:
+            print(f"\nSample unknown files:")
+            for f in unknown_files[:5]:
+                print(f"  {f.name}")
 
 
-def find_mapping_strategy(base_path):
-    """Try to find the correct mapping strategy"""
-    base_path = Path(base_path)
-    csv_path = base_path / "csv"
+def main():
+    # Your dataset path
+    dataset_path = "/home/mdbasit_tezu_ernet_in/.cache/kagglehub/datasets/awsaf49/cbis-ddsm-breast-cancer-image-dataset/versions/1"
 
-    print("\n=== Finding Mapping Strategy ===")
+    try:
+        organizer = CBISDDSMFinalOrganizer(dataset_path)
 
-    # Load case description files
-    case_files = [
-        'calc_case_description_train_set.csv',
-        'calc_case_description_test_set.csv',
-        'mass_case_description_train_set.csv',
-        'mass_case_description_test_set.csv'
-    ]
+        # Organize images
+        results = organizer.organize_images()
 
-    for filename in case_files:
-        file_path = csv_path / filename
-        if file_path.exists():
-            print(f"\n--- Analyzing {filename} ---")
-            df = pd.read_csv(file_path)
+        # Verify results
+        organizer.verify_organization()
 
-            # Common columns in CBIS-DDSM case description files
-            key_cols = ['patient_id', 'study_instance_uid', 'series_instance_uid', 'series_description']
+        print(f"\n✅ Organization successful!")
+        print(f"Your images are now organized in: {organizer.base_path / 'organized'}")
 
-            for col in key_cols:
-                if col in df.columns:
-                    print(f"{col}: {df[col].head(3).tolist()}")
-
-            # Check if there's an image file path column
-            path_cols = [col for col in df.columns if 'path' in col.lower() or 'file' in col.lower()]
-            if path_cols:
-                print(f"Path columns: {path_cols}")
-                for col in path_cols:
-                    print(f"{col}: {df[col].head(3).tolist()}")
-
-
-def create_improved_organizer(base_path):
-    """Create an improved organizer based on findings"""
-    print("\n=== Creating Improved Mapping ===")
-
-    base_path = Path(base_path)
-    csv_path = base_path / "csv"
-
-    # Load dicom_info.csv to understand SeriesInstanceUID mapping
-    dicom_info_path = csv_path / "dicom_info.csv"
-    meta_path = csv_path / "meta.csv"
-
-    if dicom_info_path.exists() and meta_path.exists():
-        dicom_df = pd.read_csv(dicom_info_path)
-        meta_df = pd.read_csv(meta_path)
-
-        print("DICOM Info columns:", dicom_df.columns.tolist())
-        print("Meta columns:", meta_df.columns.tolist())
-
-        # Check if we can map SeriesInstanceUID to actual file paths
-        if 'SeriesInstanceUID' in dicom_df.columns:
-            print("\nSample SeriesInstanceUID from dicom_info:")
-            print(dicom_df['SeriesInstanceUID'].head(3).tolist())
-
-        # Look for file paths in dicom_info
-        path_cols = [col for col in dicom_df.columns if any(word in col.lower() for word in ['path', 'file', 'name'])]
-        if path_cols:
-            print(f"\nPath columns in dicom_info: {path_cols}")
-            for col in path_cols:
-                print(f"{col}: {dicom_df[col].head(3).tolist()}")
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 if __name__ == "__main__":
-    # Update this path to match your dataset location
-    dataset_path = "/home/mdbasit_tezu_ernet_in/.cache/kagglehub/datasets/awsaf49/cbis-ddsm-breast-cancer-image-dataset/versions/1"
-
-    debug_csv_structure(dataset_path)
-    find_mapping_strategy(dataset_path)
-    create_improved_organizer(dataset_path)
+    main()
